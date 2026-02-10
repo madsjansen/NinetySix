@@ -1,6 +1,8 @@
 import os
 import json
-import time
+import smtplib
+import ssl
+from email.message import EmailMessage
 from datetime import datetime
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
@@ -13,10 +15,14 @@ from openai import OpenAI
 # --- 1. KONFIGURATION ---
 EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASS = os.getenv("EMAIL_PASS")
-IMAP_SERVER = "mail.simply.com"
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Opsæt OpenAI klienten (hvis nøglen findes)
+# Server indstillinger for Simply.dk
+IMAP_SERVER = "mail.simply.com" # Til at modtage (Læse)
+SMTP_SERVER = "smtp.simply.com" # Til at sende (Skrive)
+SMTP_PORT = 587                 # Standard port for sikker afsendelse
+
+# Opsæt OpenAI klient
 client = None
 if OPENAI_API_KEY:
     try:
@@ -39,21 +45,15 @@ Vurder også "Proximity" (Nærhed): Er afsenderen tæt på problemet?
 """
 
 # --- 2. DATABASE ---
+# Vi starter tomt - nye mails kommer automatisk ind.
 database = []
 
 # --- 3. AI FUNKTIONER ---
 def analyze_with_gpt(subject, body, sender):
-    """
-    Denne funktion nægter nu at gætte.
-    Hvis der er fejl, returnerer den en fejl-objekt.
-    """
-    
-    # 1. TJEK: Har vi overhovedet en klient?
     if not client:
-        print("KRITISK: Ingen API nøgle fundet!")
         return {
             "score": 0, 
-            "summary": "FEJL 404: Mangler OpenAI API Key i Render Environment.", 
+            "summary": "FEJL: Mangler OpenAI Key", 
             "category": "SYSTEM FEJL", 
             "proximity": "Ingen"
         }
@@ -81,39 +81,31 @@ def analyze_with_gpt(subject, body, sender):
             ],
             response_format={ "type": "json_object" }
         )
-        # Parse svaret
-        content = json.loads(response.choices[0].message.content)
-        return content
+        return json.loads(response.choices[0].message.content)
 
     except Exception as e:
-        # 2. TJEK: Fejlede kaldet til OpenAI? (F.eks. forkert kode eller tom konto)
-        error_msg = str(e)
-        print(f"OpenAI API Fejl: {error_msg}")
-        
+        print(f"OpenAI API Fejl: {e}")
         return {
             "score": 0, 
-            "summary": f"API FEJL: {error_msg[:30]}...", # Viser de første 30 tegn af fejlen
+            "summary": "AI Analyse Fejlede", 
             "category": "SYSTEM FEJL", 
             "proximity": "Fejl"
         }
 
-# --- 4. EMAIL FUNKTIONER ---
+# --- 4. EMAIL FUNKTIONER (MODTAGE) ---
 def fetch_emails():
     print("--- Tjekker for mails ---")
-    if not EMAIL_PASS: 
-        print("Mangler EMAIL_PASS - skipper tjek")
-        return
+    if not EMAIL_PASS: return
 
     try:
         with MailBox(IMAP_SERVER).login(EMAIL_USER, EMAIL_PASS) as mailbox:
-            # Hent alle ulæste mails
             for msg in mailbox.fetch(A(seen=False)):
                 print(f"Behandler: {msg.subject}")
                 
-                # Kør AI Analyse (Nu uden tilfældigheder)
+                # Kør AI Analyse
                 analysis = analyze_with_gpt(msg.subject, msg.text or msg.html, msg.from_)
                 
-                # Hvis kategorien er "SYSTEM FEJL", sætter vi titlen til at reflektere dette
+                # Håndter system fejl i titlen
                 final_title = msg.subject
                 if analysis.get("category") == "SYSTEM FEJL":
                     final_title = f"⚠️ FEJL: {msg.subject}"
@@ -136,9 +128,53 @@ def fetch_emails():
                 print(f"Tilføjet: {msg.subject} (Score: {new_entry['aiScore']})")
                 
     except Exception as e:
-        print(f"IMAP/Mail fejl: {e}")
+        print(f"IMAP Fejl: {e}")
 
-# --- 5. SETUP ---
+# --- 5. EMAIL FUNKTIONER (SENDE) ---
+def send_reward_email(recipient_email, amount, idea_title):
+    """ Sender en rigtig email via Simply.dk SMTP """
+    print(f"Forsøger at sende mail til {recipient_email}...")
+    
+    msg = EmailMessage()
+    msg['Subject'] = "🏆 Din idé er blevet belønnet!"
+    msg['From'] = EMAIL_USER
+    msg['To'] = recipient_email
+    
+    # Selve beskeden
+    body = f"""
+Hej,
+
+Tusind tak for dit input vedrørende: "{idea_title}".
+
+Ledelsen har vurderet din idé, og vi er glade for at kunne fortælle, at den er blevet udvalgt til implementering!
+
+Som tak for dit bidrag til NinetySix, har du modtaget en strakspramie på:
+{amount} kr.
+
+Beløbet udbetales sammen med din næste løn.
+
+Fortsæt det gode arbejde!
+
+De bedste hilsner,
+Innovations Dashboardet
+NinetySix
+    """
+    msg.set_content(body)
+
+    try:
+        # Opret sikker forbindelse til Simply.dk
+        context = ssl.create_default_context()
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls(context=context) # Krypter forbindelsen
+            server.login(EMAIL_USER, EMAIL_PASS)
+            server.send_message(msg)
+            print("Email sendt succesfuldt!")
+            return True
+    except Exception as e:
+        print(f"FEJL VED AFSENDELSE AF MAIL: {e}")
+        return False
+
+# --- 6. SETUP ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     scheduler = BackgroundScheduler()
@@ -155,13 +191,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 6. ENDPOINTS ---
+# --- 7. ENDPOINTS ---
 class StatusUpdate(BaseModel):
     status: str
 
 @app.get("/api/inputs")
 def get_inputs():
-    # Returner data minus emails
     return [{k:v for k,v in i.items() if k!='real_email'} for i in database]
 
 @app.put("/api/status/{item_id}")
@@ -175,12 +210,25 @@ class RewardRequest(BaseModel):
 
 @app.post("/api/reward/{item_id}")
 def reward_user(item_id: int, request: RewardRequest):
+    # 1. Find idéen
     item = next((x for x in database if x["id"] == item_id), None)
-    if item:
-        print(f"$$$ BELØNNING SENDT TIL {item.get('real_email')} PÅ {request.amount} KR $$$")
+    if not item:
+        raise HTTPException(status_code=404, detail="Ikke fundet")
+    
+    # 2. Send mailen
+    email_success = send_reward_email(
+        recipient_email=item.get('real_email'),
+        amount=request.amount,
+        idea_title=item.get('title')
+    )
+    
+    # 3. Opdater status (kun hvis mailen blev sendt, eller vi beslutter at ignorere fejl)
+    if email_success:
         item["status"] = "rewarded"
-        return {"success": True}
-    raise HTTPException(404, "Ikke fundet")
+        return {"success": True, "message": "Mail sendt og status opdateret"}
+    else:
+        # Vi returnerer en fejl til dashboardet, så du ved mailen fejlede
+        raise HTTPException(status_code=500, detail="Kunne ikke sende mail via SMTP")
 
 if __name__ == "__main__":
     import uvicorn
