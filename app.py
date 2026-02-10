@@ -39,21 +39,7 @@ Vurder også "Proximity" (Nærhed): Er afsenderen tæt på problemet?
 """
 
 # --- 2. DATABASE ---
-database = [
-    {
-        "id": 1,
-        "category": "System",
-        "title": "System Startet",
-        "content": "Venter på emails...",
-        "aiScore": 100,
-        "proximity": "System",
-        "status": "inbox",
-        "date": datetime.now().strftime("%d. %b"),
-        "groupCount": 0,
-        "analysis": "Systemet kører. Venter på input.",
-        "real_email": "admin@ninetysix.dk"
-    }
-]
+database = []
 
 # --- 3. AI FUNKTIONER ---
 def analyze_with_gpt(subject, body, sender):
