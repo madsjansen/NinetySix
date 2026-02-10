@@ -13,16 +13,18 @@ from imap_tools import MailBox, A
 from openai import OpenAI
 
 # --- 1. KONFIGURATION ---
+# Henter hemmeligheder fra Render Environment
 EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASS = os.getenv("EMAIL_PASS")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-IMAP_SERVER = "mail.simply.com"
-SMTP_SERVER = "smtp.simply.com"
-SMTP_PORT = 465 
-DATA_FILE = "database.json" # Her gemmer vi dataen
+# Server indstillinger for Simply.dk
+IMAP_SERVER = "mail.simply.com"   # Til at modtage
+SMTP_SERVER = "smtp.simply.com"   # Til at sende
+SMTP_PORT = 587                   # Vi bruger 587 med STARTTLS (Bedst til Cloud)
+DATA_FILE = "database.json"       # Fil til at gemme hukommelse
 
-# Opsæt OpenAI
+# Opsæt OpenAI klient
 client = None
 if OPENAI_API_KEY:
     try:
@@ -30,7 +32,7 @@ if OPENAI_API_KEY:
     except Exception as e:
         print(f"Kunne ikke initialisere OpenAI: {e}")
 
-# --- AI KONTEKST ---
+# --- AI KONTEKST (Hjernen) ---
 ORG_CONTEXT = """
 Du er en forretnings-AI for virksomheden "NinetySix".
 Din opgave er at vurdere mails fra medarbejdere ud fra forretningsværdi.
@@ -67,7 +69,6 @@ def save_database():
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(database, f, ensure_ascii=False, indent=4)
-        print("--- Data gemt i fil ---")
     except Exception as e:
         print(f"Kunne ikke gemme database: {e}")
 
@@ -100,25 +101,26 @@ def analyze_with_gpt(subject, body, sender):
             response_format={ "type": "json_object" }
         )
         return json.loads(response.choices[0].message.content)
-    except Exception:
-        return {"score": 0, "summary": "AI Fejl", "category": "SYSTEM", "proximity": "Fejl"}
 
-# --- 4. EMAIL FUNKTIONER (MODTAGE) ---
+    except Exception as e:
+        print(f"AI Fejl: {e}")
+        return {"score": 0, "summary": "AI Analyse Fejlede", "category": "SYSTEM", "proximity": "Fejl"}
+
+# --- 4. EMAIL FUNKTIONER (MODTAGE - IMAP) ---
 def fetch_emails():
     print("--- Tjekker for mails ---")
     if not EMAIL_PASS: return
 
     try:
         with MailBox(IMAP_SERVER).login(EMAIL_USER, EMAIL_PASS) as mailbox:
-            # Hent mails (vi tjekker nu de seneste 10 mails, også læste, for at være sikre)
-            # Men for at undgå dobbeltarbejde, tjekker vi om vi allerede har dem
-            for msg in mailbox.fetch(limit=5, reverse=True): 
+            # Hent de nyeste 5 mails (også læste, for at være sikker)
+            for msg in mailbox.fetch(limit=5, reverse=True):
                 
-                # TJEK FOR DUBLETTER: Har vi allerede en mail med dette emne og dato?
+                # DUBLET-TJEK: Har vi allerede denne mail?
+                # Vi tjekker på Emne + Afsender for at undgå at oprette den samme igen
                 is_duplicate = any(x['title'] == msg.subject and x['real_email'] == msg.from_ for x in database)
-                
                 if is_duplicate:
-                    continue # Spring over, vi har den allerede
+                    continue 
 
                 print(f"Ny mail fundet: {msg.subject}")
                 
@@ -129,7 +131,7 @@ def fetch_emails():
                 if analysis.get("category") == "SYSTEM": final_title = f"⚠️ {msg.subject}"
 
                 new_entry = {
-                    "id": int(datetime.now().timestamp()), # Bruger tid som unikt ID
+                    "id": int(datetime.now().timestamp()), # Unikt ID baseret på tid
                     "category": analysis.get("category", "Indbakke"),
                     "title": final_title,
                     "content": (msg.text or msg.html)[:400] + "...",
@@ -145,14 +147,16 @@ def fetch_emails():
                 database.insert(0, new_entry)
                 print(f"Tilføjet: {msg.subject}")
                 
-            # VIGTIGT: Gem ændringerne!
-            save_database()
+            save_database() # Gem til fil
                 
     except Exception as e:
         print(f"IMAP Fejl: {e}")
 
-# --- 5. EMAIL FUNKTIONER (SENDE) ---
+# --- 5. EMAIL FUNKTIONER (SENDE - SMTP) ---
 def send_reward_email(recipient_email, amount, idea_title):
+    """ Sender email via Port 587 med STARTTLS """
+    print(f"Forsøger at sende mail til {recipient_email}...")
+    
     msg = EmailMessage()
     msg['Subject'] = "🏆 Din idé er blevet belønnet!"
     msg['From'] = EMAIL_USER
@@ -162,7 +166,7 @@ def send_reward_email(recipient_email, amount, idea_title):
 Hej,
 
 Tusind tak for dit input vedrørende: "{idea_title}".
-Vi har udvalgt din idé til implementering!
+Ledelsen har vurderet din idé, og den er udvalgt til implementering!
 
 Du har modtaget en strakspramie på: {amount} kr.
 
@@ -172,47 +176,62 @@ NinetySix
     msg.set_content(body)
 
     try:
-        context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as server:
+        # Vi bruger her 'SMTP' (ikke SMTP_SSL) til port 587
+        # Timeout på 10 sekunder forhindrer at serveren hænger
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=15) as server:
+            # server.set_debuglevel(1) # Fjern kommentar hvis du vil se rå netværksdata i loggen
+            server.ehlo()            # Sig hej til serveren
+            server.starttls()        # Bed om kryptering
+            server.ehlo()            # Sig hej igen (krypteret)
             server.login(EMAIL_USER, EMAIL_PASS)
             server.send_message(msg)
+            print("Email sendt succesfuldt!")
             return True
     except Exception as e:
-        print(f"SMTP Fejl: {e}")
+        print(f"SMTP FEJL: {e}")
         return False
 
-# --- 6. SETUP ---
+# --- 6. SETUP & LIFESPAN ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    load_database() # 1. HENT GAMLE DATA
+    load_database() # Hent gamle data
     
     scheduler = BackgroundScheduler()
     scheduler.add_job(fetch_emails, 'interval', minutes=2)
     scheduler.start()
     
     yield
-    # (Her kunne man også gemme data når serveren lukker)
+    # Her lukker serveren ned
 
 app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # --- 7. ENDPOINTS ---
-class StatusUpdate(BaseModel):
-    status: str
+
+@app.get("/")
+def read_root():
+    return {"status": "Online", "message": "NinetySix Backend kører. Brug /api/inputs"}
 
 @app.get("/api/inputs")
 def get_inputs():
+    # Returner data minus emails (for sikkerhed på frontend)
     return [{k:v for k,v in i.items() if k!='real_email'} for i in database]
+
+class StatusUpdate(BaseModel):
+    status: str
 
 @app.put("/api/status/{item_id}")
 def update_status(item_id: int, update: StatusUpdate):
     item = next((x for x in database if x["id"] == item_id), None)
     if item: 
         item["status"] = update.status
-        save_database() # GEM EFTER STATUS ÆNDRING
+        save_database()
     return {"success": True}
 
 class RewardRequest(BaseModel):
@@ -221,16 +240,19 @@ class RewardRequest(BaseModel):
 @app.post("/api/reward/{item_id}")
 def reward_user(item_id: int, request: RewardRequest):
     item = next((x for x in database if x["id"] == item_id), None)
-    if not item: raise HTTPException(404, "Ikke fundet")
+    if not item:
+        raise HTTPException(status_code=404, detail="Ikke fundet")
     
+    # Send mailen
     success = send_reward_email(item.get('real_email'), request.amount, item.get('title'))
     
     if success:
         item["status"] = "rewarded"
-        save_database() # GEM AT VI HAR BELØNNET
+        save_database()
         return {"success": True}
     else:
-        raise HTTPException(500, "Mail kunne ikke sendes")
+        # Hvis SMTP fejler, giver vi besked til dashboardet
+        raise HTTPException(status_code=500, detail="Kunne ikke sende mail (SMTP Timeout/Fejl)")
 
 if __name__ == "__main__":
     import uvicorn
