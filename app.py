@@ -109,6 +109,22 @@ def get_inputs():
         public_data.append(safe_item)
     return public_data
 
+# --- NYT: Model til statusopdatering ---
+class StatusUpdate(BaseModel):
+    status: str
+
+@app.put("/api/status/{item_id}")
+def update_status_endpoint(item_id: int, update: StatusUpdate):
+    # Find elementet
+    item = next((x for x in database if x["id"] == item_id), None)
+    if not item:
+        raise HTTPException(status_code=404, detail="Ikke fundet")
+    
+    # Opdater status i hukommelsen
+    item["status"] = update.status
+    print(f"Opdateret status for ID {item_id} -> {update.status}")
+    return {"success": True}
+
 class RewardRequest(BaseModel):
     amount: int
 
